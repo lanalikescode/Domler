@@ -65,10 +65,13 @@ DEFAULT_MIN_SCORE = 4
 DEFAULT_PER_DOMAIN = 10
 
 OUTPUT_COLUMNS = [
+    "total_score",
     "our_domain",
     "website",
     "business_name",
     "phone",
+    "country_code",
+    "end_date",
     "address",
     "rating",
     "reviews",
@@ -77,7 +80,6 @@ OUTPUT_COLUMNS = [
     "tld_bonus",
     "hyphen_bonus",
     "edge_bonus",
-    "total_score",
     "sld",
     "query_used",
     "place_id",
@@ -164,6 +166,27 @@ def similarity_score(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return fuzz.ratio(a, b) / 20.0
+
+
+def extract_country_code(detail: Dict[str, object]) -> str:
+    """Return an international calling code if one can be inferred."""
+
+    raw = detail.get("international_phone_number")
+    if isinstance(raw, str) and raw.strip():
+        match = re.search(r"\+\d{1,4}", raw)
+        if match:
+            return match.group(0)
+
+    raw = detail.get("formatted_phone_number")
+    if isinstance(raw, str) and raw.strip():
+        match = re.search(r"\+\d{1,4}", raw)
+        if match:
+            return match.group(0)
+        digits = re.sub(r"\D", "", raw)
+        if digits:
+            return digits[:4]
+
+    return ""
 
 
 def compute_candidate_score(sld: str, business_name: str, website: str) -> Tuple[float, Dict[str, float]]:
@@ -329,6 +352,7 @@ def load_filtered_domains(path: str) -> List[Dict[str, str]]:
 def process_domain(
     domain: str,
     sld: str,
+    end_date: str,
     region: Optional[str],
     api_key: str,
     queries_cache: Dict[str, object],
@@ -371,11 +395,16 @@ def process_domain(
         if total < min_match_score:
             continue
 
+        phone = detail.get("formatted_phone_number") or detail.get("international_phone_number")
+
         candidate = {
+            "total_score": breakdown["total_score"],
             "our_domain": domain,
             "website": normalized_website,
             "business_name": detail.get("name"),
-            "phone": detail.get("formatted_phone_number"),
+            "phone": phone,
+            "country_code": extract_country_code(detail),
+            "end_date": end_date,
             "address": detail.get("formatted_address"),
             "rating": detail.get("rating"),
             "reviews": detail.get("user_ratings_total"),
@@ -384,7 +413,6 @@ def process_domain(
             "tld_bonus": breakdown["tld_bonus"],
             "hyphen_bonus": breakdown["hyphen_bonus"],
             "edge_bonus": breakdown["edge_bonus"],
-            "total_score": breakdown["total_score"],
             "sld": sld,
             "query_used": f"{sld}|{region or ''}",
             "place_id": place_id,
@@ -435,12 +463,14 @@ def gather_matches(
         for row in tqdm(rows, total=total, desc="Matching domains"):
             domain = str(row.get("domain", "")).strip()
             sld = str(row.get("sld", "")).strip().lower()
+            end_date = str(row.get("end_date", "")).strip()
             if not domain or not sld:
                 continue
 
             results, queries_cache, details_cache, api_calls = process_domain(
                 domain,
                 sld,
+                end_date,
                 region,
                 api_key,
                 queries_cache,

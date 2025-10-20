@@ -10,11 +10,11 @@ Domain filtering and buyer matching utilities for `.com` auctions.
    * `domler_filtered.csv` – survivors with a scoring breakdown.
    * `domler_calllist.csv` – top 100 domains by score.
 
-## Matcher (`domler_matcher_cq.py`)
+## Matcher (`matcher.py`)
 
 1. Ensure `domler_filtered.csv` exists from the filter step.
 2. Provide a Google Maps API key via the `GOOGLE_MAPS_API_KEY` environment variable or by creating `api.txt` with the key on the first line.
-3. Run `python domler_matcher_cq.py --stats` for the default workflow. Useful flags:
+3. Run `python matcher.py --stats` for the default workflow. Useful flags:
    * `--region us` – bias Text Search to a specific region.
    * `--limit 400` – cap API calls (negative disables the cap).
    * `--per_domain 10` – adjust matches kept per domain.
