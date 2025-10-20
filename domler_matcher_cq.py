@@ -14,18 +14,24 @@ rules, and CSV output layout.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
 import shutil
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import pandas as pd
-import requests
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal environments
+    def tqdm(iterable: Iterable, **_kwargs):  # type: ignore
+        return iterable
 
 try:
     from rapidfuzz import fuzz
@@ -77,6 +83,10 @@ OUTPUT_COLUMNS = [
     "place_id",
     "source",
 ]
+
+
+class ApiRequestError(RuntimeError):
+    """Wrapper exception for HTTP errors."""
 
 
 def load_api_key(path: str) -> str:
@@ -187,13 +197,26 @@ def compute_candidate_score(sld: str, business_name: str, website: str) -> Tuple
     return total, breakdown
 
 
+def _http_get_json(url: str, params: Dict[str, str]) -> Dict[str, object]:
+    query = urllib.parse.urlencode(params)
+    target = f"{url}?{query}"
+    try:
+        with urllib.request.urlopen(target, timeout=30) as handle:
+            payload = handle.read()
+    except urllib.error.URLError as exc:  # pragma: no cover - network failure path
+        raise ApiRequestError(str(exc)) from exc
+
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError as exc:  # pragma: no cover - invalid JSON path
+        raise ApiRequestError(f"Invalid JSON response: {exc}") from exc
+
+
 def text_search(query: str, api_key: str, region: Optional[str]) -> Dict[str, object]:
     params = {"query": query, "key": api_key}
     if region:
         params["region"] = region
-    response = requests.get(TEXT_SEARCH_URL, params=params, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    return _http_get_json(TEXT_SEARCH_URL, params)
 
 
 def place_details(place_id: str, api_key: str) -> Dict[str, object]:
@@ -202,9 +225,7 @@ def place_details(place_id: str, api_key: str) -> Dict[str, object]:
         "key": api_key,
         "fields": "name,formatted_phone_number,formatted_address,website,rating,user_ratings_total",
     }
-    response = requests.get(DETAILS_URL, params=params, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    return _http_get_json(DETAILS_URL, params)
 
 
 def maybe_increment(api_calls: int, limit: Optional[int]) -> int:
@@ -238,7 +259,7 @@ def fetch_place_ids(
     api_calls = maybe_increment(api_calls, limit)
     try:
         response = text_search(sld, api_key, region)
-    except requests.RequestException as exc:  # pragma: no cover - network failure path
+    except ApiRequestError as exc:  # pragma: no cover - network failure path
         print(f"Warning: text search failed for {sld}: {exc}", file=sys.stderr)
         queries_cache[key] = {"status": "no_results", "ts": time.time()}
         return None, queries_cache, api_calls
@@ -270,7 +291,7 @@ def fetch_place_details(
     api_calls = maybe_increment(api_calls, limit)
     try:
         response = place_details(place_id, api_key)
-    except requests.RequestException as exc:  # pragma: no cover - network failure path
+    except ApiRequestError as exc:  # pragma: no cover - network failure path
         print(f"Warning: details request failed for {place_id}: {exc}", file=sys.stderr)
         return None, details_cache, api_calls, "api"
 
@@ -283,16 +304,26 @@ def fetch_place_details(
     return result, details_cache, api_calls, "api"
 
 
-def load_filtered_domains(path: str) -> pd.DataFrame:
+def load_filtered_domains(path: str) -> List[Dict[str, str]]:
     if not os.path.exists(path):
         raise SystemExit(f"Error: filtered domains file '{path}' not found.")
 
-    df = pd.read_csv(path)
-    required = {"domain", "sld"}
-    if not required.issubset(df.columns):
-        missing = ", ".join(sorted(required - set(df.columns)))
-        raise SystemExit(f"Error: filtered domains file missing required columns: {missing}")
-    return df
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise SystemExit("Error: filtered domains file has no header row.")
+
+        required = {"domain", "sld"}
+        missing = required - set(reader.fieldnames)
+        if missing:
+            missing_list = ", ".join(sorted(missing))
+            raise SystemExit(f"Error: filtered domains file missing required columns: {missing_list}")
+
+        rows: List[Dict[str, str]] = []
+        for row in reader:
+            rows.append(row)
+
+    return rows
 
 
 def process_domain(
@@ -378,7 +409,7 @@ def process_domain(
 
 
 def gather_matches(
-    df: pd.DataFrame,
+    rows: Sequence[Dict[str, object]],
     region: Optional[str],
     api_key: str,
     cache_dir: str,
@@ -400,7 +431,8 @@ def gather_matches(
     all_results: List[Dict[str, object]] = []
 
     try:
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Matching domains"):
+        total = len(rows)
+        for row in tqdm(rows, total=total, desc="Matching domains"):
             domain = str(row.get("domain", "")).strip()
             sld = str(row.get("sld", "")).strip().lower()
             if not domain or not sld:
@@ -494,10 +526,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         queries_cache = read_json(os.path.join(args.cache_dir, "queries.json"))
         details_cache = read_json(os.path.join(args.cache_dir, "details.json"))
 
-    df_out = pd.DataFrame(results, columns=OUTPUT_COLUMNS)
-    df_out.to_csv(args.output, index=False)
+    with open(args.output, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
 
-    print(f"Wrote {len(df_out)} matches to {args.output}.")
+    print(f"Wrote {len(results)} matches to {args.output}.")
 
     if args.stats:
         print(format_stats(queries_cache, details_cache))
