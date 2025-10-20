@@ -169,22 +169,19 @@ def similarity_score(a: str, b: str) -> float:
 
 
 def extract_country_code(detail: Dict[str, object]) -> str:
-    """Return an international calling code if one can be inferred."""
+    """Return a two-letter country code if one can be inferred."""
 
-    raw = detail.get("international_phone_number")
-    if isinstance(raw, str) and raw.strip():
-        match = re.search(r"\+\d{1,4}", raw)
-        if match:
-            return match.group(0)
-
-    raw = detail.get("formatted_phone_number")
-    if isinstance(raw, str) and raw.strip():
-        match = re.search(r"\+\d{1,4}", raw)
-        if match:
-            return match.group(0)
-        digits = re.sub(r"\D", "", raw)
-        if digits:
-            return digits[:4]
+    components = detail.get("address_components")
+    if isinstance(components, list):
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            types = component.get("types", [])
+            if not isinstance(types, list) or "country" not in types:
+                continue
+            code = component.get("short_name")
+            if isinstance(code, str) and code.strip():
+                return code.strip().upper()
 
     return ""
 
@@ -195,6 +192,17 @@ def compute_candidate_score(sld: str, business_name: str, website: str) -> Tuple
 
     website_root = normalized_output_website(website)
     site_sld = website_sld(website_root)
+    if site_sld == sld and sld:
+        breakdown = {
+            "name_pts": 0.0,
+            "site_pts": 0.0,
+            "tld_bonus": 0.0,
+            "hyphen_bonus": 0.0,
+            "edge_bonus": 0.0,
+            "total_score": 100.0,
+        }
+        return 100.0, breakdown
+
     site_pts = similarity_score(sld, site_sld)
 
     tld = website_root.split(".")[-1] if website_root else ""
@@ -207,7 +215,7 @@ def compute_candidate_score(sld: str, business_name: str, website: str) -> Tuple
     if norm_name.startswith(sld) or norm_name.endswith(sld):
         edge_bonus += 1.0
 
-    total = name_pts + site_pts + tld_bonus + hyphen_bonus + edge_bonus
+    total = min(100.0, name_pts + site_pts + tld_bonus + hyphen_bonus + edge_bonus)
 
     breakdown = {
         "name_pts": round(name_pts, 3),
@@ -246,7 +254,9 @@ def place_details(place_id: str, api_key: str) -> Dict[str, object]:
     params = {
         "place_id": place_id,
         "key": api_key,
-        "fields": "name,formatted_phone_number,formatted_address,website,rating,user_ratings_total",
+        "fields": (
+            "name,formatted_phone_number,formatted_address,website,rating," "user_ratings_total,address_components"
+        ),
     }
     return _http_get_json(DETAILS_URL, params)
 
