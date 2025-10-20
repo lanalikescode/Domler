@@ -15,13 +15,19 @@ feedback so the behaviour is easy to follow locally.
 
 from __future__ import annotations
 
+import csv
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Set
+from dataclasses import dataclass
+from functools import cmp_to_key
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
-import pandas as pd
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal environments
+    def tqdm(iterable, **_kwargs):  # type: ignore
+        return iterable
 
 
 AUCTION_FILE = "auction.csv"
@@ -314,21 +320,79 @@ def calculate_score_components(sld: str, dictionary_words: Set[str]) -> Dict[str
     return components
 
 
-def ensure_required_columns(df: pd.DataFrame) -> None:
-    if "name" not in df.columns:
+def ensure_required_columns(columns: Iterable[str]) -> None:
+    if "name" not in set(columns):
         print("Error: auction.csv must contain a 'name' column.", file=sys.stderr)
         sys.exit(1)
 
 
-def process_auction(dictionary_words: Set[str]) -> pd.DataFrame:
-    df = pd.read_csv(AUCTION_FILE)
-    ensure_required_columns(df)
+def read_auction_rows(path: str) -> List[Dict[str, str]]:
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            print("Error: auction.csv appears to be empty.", file=sys.stderr)
+            sys.exit(1)
 
-    optional_columns = [col for col in ["price_usd", "bid_count", "end_date", "permalink"] if col in df.columns]
+        fieldnames = [name.lstrip("\ufeff") if name else name for name in reader.fieldnames]
+        reader.fieldnames = fieldnames
+
+        ensure_required_columns(fieldnames)
+        rows = []
+        for row in reader:
+            cleaned_row = {key.lstrip("\ufeff") if key else key: value for key, value in row.items()}
+            rows.append(cleaned_row)
+
+    return rows
+
+
+@dataclass
+class ResultTable:
+    rows: List[Dict[str, object]]
+    columns: Sequence[str]
+
+    def sort_values(self, by: Sequence[str], ascending: Sequence[bool], kind: Optional[str] = None) -> "ResultTable":
+        def comparator(left: Dict[str, object], right: Dict[str, object]) -> int:
+            for column, asc in zip(by, ascending):
+                lv = left.get(column)
+                rv = right.get(column)
+                if lv == rv:
+                    continue
+                if lv is None:
+                    return -1 if asc else 1
+                if rv is None:
+                    return 1 if asc else -1
+                if lv < rv:
+                    return -1 if asc else 1
+                if lv > rv:
+                    return 1 if asc else -1
+            return 0
+
+        sorted_rows = sorted(self.rows, key=cmp_to_key(comparator))
+        return ResultTable(sorted_rows, self.columns)
+
+    def head(self, count: int) -> "ResultTable":
+        return ResultTable(self.rows[:count], self.columns)
+
+    def to_csv(self, path: str, index: bool = False) -> None:  # noqa: ARG002 - retained for API parity
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(self.columns))
+            writer.writeheader()
+            for row in self.rows:
+                writer.writerow({column: row.get(column, "") for column in self.columns})
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+
+def process_auction(dictionary_words: Set[str]) -> ResultTable:
+    source_rows = read_auction_rows(AUCTION_FILE)
+
+    optional_candidates = ["price_usd", "bid_count", "end_date", "permalink"]
+    optional_columns = [col for col in optional_candidates if col in source_rows[0].keys()] if source_rows else []
 
     rows: List[Dict[str, object]] = []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Scoring domains"):
-        domain_raw = str(row["name"]).strip()
+    for row in tqdm(source_rows, total=len(source_rows), desc="Scoring domains"):
+        domain_raw = str(row.get("name", "")).strip()
         sld = extract_sld(domain_raw)
         if not sld:
             continue
@@ -364,29 +428,25 @@ def process_auction(dictionary_words: Set[str]) -> pd.DataFrame:
 
         rows.append(record)
 
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "domain",
-                "sld",
-                "len",
-                "score",
-                "dict_hits_edge",
-                "full_segmentation",
-                "dict_bonus",
-                "single_bonus",
-                "suffix_bonus",
-                "tech_bonus",
-                "nature_bonus",
-                "values_bonus",
-                "compound_bonus",
-                "misspelling",
-                "len_penalty",
-            ]
-            + optional_columns
-        )
+    columns = [
+        "domain",
+        "sld",
+        "len",
+        "score",
+        "dict_hits_edge",
+        "full_segmentation",
+        "dict_bonus",
+        "single_bonus",
+        "suffix_bonus",
+        "tech_bonus",
+        "nature_bonus",
+        "values_bonus",
+        "compound_bonus",
+        "misspelling",
+        "len_penalty",
+    ] + optional_columns
 
-    filtered_df = pd.DataFrame(rows)
+    filtered_table = ResultTable(rows, columns)
     sort_columns = [
         ("score", False),
         ("dict_bonus", False),
@@ -395,13 +455,13 @@ def process_auction(dictionary_words: Set[str]) -> pd.DataFrame:
         ("len", True),
     ]
 
-    filtered_df = filtered_df.sort_values(
+    filtered_table = filtered_table.sort_values(
         by=[col for col, _ in sort_columns],
         ascending=[asc for _, asc in sort_columns],
         kind="mergesort",
     )
 
-    return filtered_df
+    return filtered_table
 
 
 def main() -> None:
